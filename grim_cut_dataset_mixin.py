@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import csv
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, QThread, Qt, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -596,7 +597,7 @@ def _write_dataset_csv(
 
 
 def _load_dataset_csv(path: str) -> "RcsGrid":
-    """Load a dataset from a CSV/TSV exported by _write_dataset_csv()."""
+    """Load a dataset from a delimited text file exported by _write_dataset_csv()."""
     with open(path, "r", newline="", encoding="utf-8-sig") as f:
         sample = f.read(4096)
         f.seek(0)
@@ -720,6 +721,36 @@ def _load_dataset_csv(path: str) -> "RcsGrid":
     )
 
 
+def _load_dataset_from_dropped_text(path: str) -> tuple["RcsGrid", str]:
+    """Load dropped delimited files, including theta/phi text variants."""
+    lower = path.lower()
+    attempts = []
+    if lower.endswith(".txt"):
+        attempts = [
+            ("theta/phi TXT", lambda: RcsGrid.load_theta_phi_txt(path)),
+            ("delimited table", lambda: _load_dataset_csv(path)),
+        ]
+    elif lower.endswith(".csv"):
+        attempts = [
+            ("delimited table", lambda: _load_dataset_csv(path)),
+            ("theta/phi CSV", lambda: RcsGrid.load_theta_phi_csv(path)),
+        ]
+    else:
+        attempts = [("delimited table", lambda: _load_dataset_csv(path))]
+
+    errors: list[str] = []
+    for label, loader in attempts:
+        try:
+            dataset = loader()
+            history = str(getattr(dataset, "history", "") or "").strip()
+            if not history:
+                history = f"Imported delimited text: {path}"
+            return dataset, history
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+    raise ValueError("; ".join(errors))
+
+
 class TimeGateDialog(QDialog):
     """Parameters for time-domain gating of frequency-domain RCS data."""
 
@@ -836,46 +867,350 @@ def _apply_time_gate(
         units=dataset.units,
     )
 
-class DatasetOpsMixin:
-    def _handle_files_dropped(self, paths: list[str]) -> None:
-        loaded = 0
+
+def _is_supported_dataset_path(path: str) -> bool:
+    lower = str(path).lower()
+    return lower.endswith(".grim") or lower.endswith(".csv") or lower.endswith(".tsv") or lower.endswith(".txt")
+
+
+def _recommended_loader_workers(task_count: int) -> int:
+    cpu_total = os.cpu_count() or 1
+    if cpu_total <= 2:
+        target = cpu_total
+    else:
+        target = cpu_total - 1
+    return max(1, min(int(task_count), int(target)))
+
+
+def _load_dataset_path_task(task: tuple[int, str]) -> dict[str, object]:
+    index, path = task
+    file_name = os.path.basename(path)
+    dataset_name = os.path.splitext(file_name)[0]
+    lower = path.lower()
+    try:
+        if lower.endswith(".grim"):
+            dataset = RcsGrid.load(path)
+            history = path
+        elif lower.endswith(".csv") or lower.endswith(".tsv") or lower.endswith(".txt"):
+            dataset, history = _load_dataset_from_dropped_text(path)
+        else:
+            return {
+                "status": "ignored",
+                "index": index,
+                "path": path,
+                "file_name": file_name,
+                "error": "Unsupported file extension",
+            }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "index": index,
+            "path": path,
+            "file_name": file_name,
+            "error": str(exc),
+        }
+
+    return {
+        "status": "ok",
+        "index": index,
+        "path": path,
+        "file_name": file_name,
+        "name": dataset_name,
+        "history": history,
+        "dataset": dataset,
+    }
+
+
+def _join_many_with_progress(
+    grids: list[RcsGrid],
+    *,
+    tol: float = 1e-6,
+    progress_cb=None,
+) -> RcsGrid:
+    checked = RcsGrid._ensure_grids(grids)
+    total = len(checked)
+    if total == 1:
+        grid = checked[0]
+        if progress_cb is not None:
+            progress_cb(1, 1)
+        return grid._new_grid(
+            np.array(grid.azimuths, copy=True),
+            np.array(grid.elevations, copy=True),
+            np.array(grid.frequencies, copy=True),
+            np.array(grid.polarizations, copy=True),
+            rcs_power=np.array(grid.rcs_power, copy=True),
+            rcs_phase=np.array(grid.rcs_phase, copy=True),
+            rcs_domain="power_phase",
+        )
+
+    az_union = RcsGrid._axis_union([grid.azimuths for grid in checked], tol=tol)
+    el_union = RcsGrid._axis_union([grid.elevations for grid in checked], tol=tol)
+    f_union = RcsGrid._axis_union([grid.frequencies for grid in checked], tol=tol)
+    p_union = RcsGrid._axis_union([grid.polarizations for grid in checked], tol=0.0)
+
+    shape = (len(az_union), len(el_union), len(f_union), len(p_union))
+    joined_power = np.full(shape, np.nan, dtype=np.float32)
+    joined_phase = np.full(shape, np.nan, dtype=np.float32)
+
+    for idx, grid in enumerate(checked, start=1):
+        az_idx = RcsGrid._indices_for_axis_values(az_union, grid.azimuths, tol=tol)
+        el_idx = RcsGrid._indices_for_axis_values(el_union, grid.elevations, tol=tol)
+        f_idx = RcsGrid._indices_for_axis_values(f_union, grid.frequencies, tol=tol)
+        p_idx = RcsGrid._indices_for_axis_values(p_union, grid.polarizations, tol=0.0)
+        if az_idx is None or el_idx is None or f_idx is None or p_idx is None:
+            raise ValueError("failed to align a dataset during join")
+        joined_power[np.ix_(az_idx, el_idx, f_idx, p_idx)] = grid.rcs_power
+        joined_phase[np.ix_(az_idx, el_idx, f_idx, p_idx)] = grid.rcs_phase
+        if progress_cb is not None:
+            progress_cb(idx, total)
+
+    last = checked[-1]
+    return RcsGrid(
+        az_union,
+        el_union,
+        f_union,
+        p_union,
+        rcs_power=joined_power,
+        rcs_phase=joined_phase,
+        rcs_domain="power_phase",
+        source_path=last.source_path,
+        history=last.history,
+        units=dict(last.units),
+    )
+
+
+class _DatasetLoadWorker(QObject):
+    progress = Signal(int, int, str)
+    finished = Signal(object)
+
+    def __init__(self, tasks: list[tuple[int, str]], ignored_count: int = 0, parent=None) -> None:
+        super().__init__(parent)
+        self._tasks = list(tasks)
+        self._ignored_count = int(ignored_count)
+
+    def run(self) -> None:
+        total = len(self._tasks)
+        loaded: list[dict[str, object]] = []
         failed: list[str] = []
-        ignored = 0
-        for path in paths:
-            lower = path.lower()
-            file_name = os.path.basename(path)
-            name = os.path.splitext(file_name)[0]
+        used_multiprocessing = False
+        fallback_reason: str | None = None
+
+        def _consume(result: dict[str, object], done_count: int) -> None:
+            status = str(result.get("status", "error"))
+            file_name = str(result.get("file_name", "dataset"))
+            if status == "ok":
+                loaded.append(result)
+                self.progress.emit(done_count, total, f"Loaded {file_name}")
+                return
+            error_text = str(result.get("error", "Unknown error"))
+            failed.append(f"{file_name} ({error_text})")
+            self.progress.emit(done_count, total, f"Failed {file_name}")
+
+        if total == 0:
+            self.finished.emit(
+                {
+                    "loaded": loaded,
+                    "failed": failed,
+                    "ignored": self._ignored_count,
+                    "used_multiprocessing": used_multiprocessing,
+                    "fallback_reason": fallback_reason,
+                    "total_supported": total,
+                }
+            )
+            return
+
+        if total == 1:
+            _consume(_load_dataset_path_task(self._tasks[0]), 1)
+        else:
+            worker_count = _recommended_loader_workers(total)
             try:
-                if lower.endswith(".grim"):
-                    dataset = RcsGrid.load(path)
-                    history = path
-                elif lower.endswith(".csv") or lower.endswith(".tsv"):
-                    dataset = _load_dataset_csv(path)
-                    history = f"Imported CSV: {path}"
-                else:
-                    ignored += 1
-                    continue
+                with ProcessPoolExecutor(max_workers=worker_count) as pool:
+                    futures = {
+                        pool.submit(_load_dataset_path_task, task): task
+                        for task in self._tasks
+                    }
+                    done_count = 0
+                    for future in as_completed(futures):
+                        result = future.result()
+                        done_count += 1
+                        _consume(result, done_count)
+                used_multiprocessing = True
             except Exception as exc:
-                failed.append(f"{file_name} ({exc})")
+                fallback_reason = str(exc)
+                loaded.clear()
+                failed.clear()
+                for done_count, task in enumerate(self._tasks, start=1):
+                    _consume(_load_dataset_path_task(task), done_count)
+
+        self.finished.emit(
+            {
+                "loaded": loaded,
+                "failed": failed,
+                "ignored": self._ignored_count,
+                "used_multiprocessing": used_multiprocessing,
+                "fallback_reason": fallback_reason,
+                "total_supported": total,
+            }
+        )
+
+
+class _JoinDatasetsWorker(QObject):
+    progress = Signal(int, int, str)
+    finished = Signal(object)
+
+    def __init__(self, grids: list[RcsGrid], tol: float = 1e-6, parent=None) -> None:
+        super().__init__(parent)
+        self._grids = list(grids)
+        self._tol = float(tol)
+
+    def run(self) -> None:
+        total = max(1, len(self._grids))
+        try:
+            def _emit_progress(done_count: int, total_count: int) -> None:
+                self.progress.emit(done_count, total_count, "Joining datasets")
+
+            merged = _join_many_with_progress(self._grids, tol=self._tol, progress_cb=_emit_progress)
+        except Exception as exc:
+            self.finished.emit({"ok": False, "error": str(exc), "total": total})
+            return
+        self.finished.emit({"ok": True, "merged": merged, "total": total})
+
+
+class DatasetOpsMixin:
+    def _ensure_background_worker_state(self) -> None:
+        if hasattr(self, "_background_worker_thread"):
+            return
+        self._background_worker_thread: QThread | None = None
+        self._background_worker: QObject | None = None
+        self._background_worker_name = ""
+        self._pending_join_names: list[str] | None = None
+
+    def _background_job_active(self) -> bool:
+        self._ensure_background_worker_state()
+        thread = self._background_worker_thread
+        return isinstance(thread, QThread) and thread.isRunning()
+
+    def _try_start_background_job(self, job_name: str, worker: QObject) -> bool:
+        self._ensure_background_worker_state()
+        if self._background_job_active():
+            active_name = self._background_worker_name or "Another background job"
+            self.status.showMessage(f"{active_name} is still running. Please wait.")
+            return False
+
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_background_thread_finished)
+
+        self._background_worker_thread = thread
+        self._background_worker = worker
+        self._background_worker_name = job_name
+        thread.start()
+        return True
+
+    def _on_background_thread_finished(self) -> None:
+        self._background_worker_thread = None
+        self._background_worker = None
+        self._background_worker_name = ""
+
+    def _on_load_worker_progress(self, done_count: int, total_count: int, detail: str) -> None:
+        detail_text = str(detail).strip()
+        if detail_text:
+            self.status.showMessage(
+                f"Loading datasets... {done_count}/{total_count} ({detail_text})"
+            )
+            return
+        self.status.showMessage(f"Loading datasets... {done_count}/{total_count}")
+
+    def _on_load_worker_finished(self, summary: dict[str, object]) -> None:
+        loaded_entries_raw = summary.get("loaded", [])
+        failed_entries_raw = summary.get("failed", [])
+        ignored = int(summary.get("ignored", 0) or 0)
+        fallback_reason = summary.get("fallback_reason")
+        used_multiprocessing = bool(summary.get("used_multiprocessing", False))
+        total_supported = int(summary.get("total_supported", 0) or 0)
+
+        loaded_entries = [entry for entry in loaded_entries_raw if isinstance(entry, dict)]
+        loaded_entries.sort(key=lambda item: int(item.get("index", 0)))
+        failed = [str(item) for item in failed_entries_raw]
+
+        loaded = 0
+        for entry in loaded_entries:
+            dataset = entry.get("dataset")
+            if not isinstance(dataset, RcsGrid):
+                file_name = str(entry.get("file_name", "dataset"))
+                failed.append(f"{file_name} (worker returned invalid dataset)")
                 continue
+            name = str(entry.get("name", "dataset"))
+            history = str(entry.get("history", ""))
+            file_name = str(entry.get("file_name", ""))
             self._add_dataset_row(dataset, name, history, file_name=file_name)
             loaded += 1
 
         if failed:
             msg = f"Loaded {loaded} dataset(s)." if loaded else "No datasets loaded."
             msg += f" Failed: {', '.join(failed)}"
-            if ignored:
-                msg += f" Ignored {ignored} unsupported file(s)."
-            self.status.showMessage(msg)
-            return
-        if loaded:
+        elif loaded:
             msg = f"Loaded {loaded} dataset(s)."
-            if ignored:
-                msg += f" Ignored {ignored} unsupported file(s)."
-            self.status.showMessage(msg)
-            return
+        else:
+            msg = "No datasets loaded."
+
         if ignored:
-            self.status.showMessage("No supported dropped files. Supported: .grim, .csv, .tsv")
+            msg += f" Ignored {ignored} unsupported file(s)."
+        if fallback_reason:
+            msg += " Multiprocessing unavailable; used single-worker fallback."
+        elif used_multiprocessing and total_supported > 1:
+            msg += " Loaded in parallel."
+        self.status.showMessage(msg)
+
+    def _on_join_worker_progress(self, done_count: int, total_count: int, _: str) -> None:
+        self.status.showMessage(f"Joining datasets... {done_count}/{total_count}")
+
+    def _on_join_worker_finished(self, payload: dict[str, object]) -> None:
+        names = self._pending_join_names or []
+        self._pending_join_names = None
+
+        ok = bool(payload.get("ok", False))
+        if not ok:
+            self.status.showMessage(str(payload.get("error", "Join failed.")))
+            return
+
+        merged = payload.get("merged")
+        if not isinstance(merged, RcsGrid):
+            self.status.showMessage("Join failed: worker produced invalid output.")
+            return
+
+        if not names:
+            names = ["Dataset"]
+        new_name = " | ".join(names)
+        history = f"Join (last selected wins overlap): {new_name}"
+        self._add_dataset_row(merged, f"Join[{new_name}]", history, file_name="")
+        self.status.showMessage(f"Join created. Overlap winner: {names[-1]}.")
+
+    def _handle_files_dropped(self, paths: list[str]) -> None:
+        tasks: list[tuple[int, str]] = []
+        ignored = 0
+        for index, raw_path in enumerate(paths):
+            path = str(raw_path)
+            if _is_supported_dataset_path(path):
+                tasks.append((index, path))
+            else:
+                ignored += 1
+
+        if not tasks:
+            if ignored:
+                self.status.showMessage("No supported dropped files. Supported: .grim, .csv, .txt")
+            return
+
+        worker = _DatasetLoadWorker(tasks, ignored_count=ignored)
+        worker.progress.connect(self._on_load_worker_progress)
+        worker.finished.connect(self._on_load_worker_finished)
+        if not self._try_start_background_job("Dataset loading", worker):
+            return
+        self.status.showMessage(f"Loading datasets... 0/{len(tasks)}")
 
     def _add_dataset_row(self, dataset: RcsGrid, name: str, history: str, file_name: str | None = None) -> None:
         row = self.table.rowCount()
@@ -1124,16 +1459,13 @@ class DatasetOpsMixin:
 
         names = [name for name, _ in datasets]
         grids = [grid for _, grid in datasets]
-        try:
-            merged = RcsGrid.join_many(*grids, tol=1e-6)
-        except (ValueError, TypeError) as exc:
-            self.status.showMessage(str(exc))
+        worker = _JoinDatasetsWorker(grids, tol=1e-6)
+        worker.progress.connect(self._on_join_worker_progress)
+        worker.finished.connect(self._on_join_worker_finished)
+        if not self._try_start_background_job("Dataset join", worker):
             return
-
-        new_name = " | ".join(names)
-        history = f"Join (last selected wins overlap): {new_name}"
-        self._add_dataset_row(merged, f"Join[{new_name}]", history, file_name="")
-        self.status.showMessage(f"Join created. Overlap winner: {names[-1]}.")
+        self._pending_join_names = names
+        self.status.showMessage(f"Joining datasets... 0/{len(grids)}")
 
     def _overlap_selected_datasets(self) -> None:
         datasets = self._selected_datasets_ordered(
